@@ -1,5 +1,8 @@
 www:
   type: python
+  config:
+    uwsgi_harakiri: 10
+    uswgi_harakiri_verbose: true
   systempackages:
     - gdal-bin
     - libgdal1-dev
