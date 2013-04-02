@@ -7,7 +7,7 @@ from django.core.cache import cache
 from djangorestframework.response import ErrorResponse
 from mock import patch
 from nose.tools import (istest, assert_equal, assert_not_equal, assert_in,
-                        assert_raises, assert_is_not_none)
+                        assert_raises, assert_is_not_none, assert_not_in, ok_)
 from ..models import DataSet, Place, Submission, SubmissionSet, Attachment
 from ..models import SubmittedThing, Activity
 from ..views import SubmissionCollectionView
@@ -367,13 +367,17 @@ class TestMakingAPostRequestToASubmissionTypeCollectionUrl (TestCase):
 class TestSubmissionInstanceAPI (TestCase):
 
     def setUp(self):
+        from sa_api.apikey.models import ApiKey
+
         User.objects.all().delete()
         DataSet.objects.all().delete()
         Place.objects.all().delete()
         Submission.objects.all().delete()
         SubmissionSet.objects.all().delete()
+        ApiKey.objects.all().delete()
 
         self.owner = User.objects.create(username='user')
+        self.apikey = ApiKey.objects.create(user_id=self.owner.id, key='abcd1234')
         self.dataset = DataSet.objects.create(slug='data',
                                               owner_id=self.owner.id)
         self.place = Place.objects.create(location='POINT(0 0)',
@@ -430,7 +434,7 @@ class TestSubmissionInstanceAPI (TestCase):
 
     @istest
     def submission_get_request_retrieves_data(self):
-        self.submission.data = json.dumps({'animal': 'tree frog'})
+        self.submission.data = json.dumps({'animal': 'tree frog', 'private-email': 'admin@example.com'})
         self.submission.save()
         request = RequestFactory().get(self.url)
         # Anonymous is OK.
@@ -447,6 +451,112 @@ class TestSubmissionInstanceAPI (TestCase):
         assert_equal(response.status_code, 200)
         data = json.loads(response.content)
         assert_equal(data['animal'], 'tree frog')
+        assert_not_in('private-email', data)
+
+    @istest
+    def submission_get_request_retrieves_data_when_directly_authenticated_as_superuser(self):
+        self.submission.data = json.dumps({'animal': 'tree frog', 'private-email': 'admin@example.com'})
+        self.submission.save()
+        request = RequestFactory().get(self.url + '?show_private=on')
+        request.user = mock.Mock(**{'is_authenticated.return_value': True,
+                                    'is_superuser': True,
+                                    })
+        request.META['HTTP_ACCEPT'] = 'application/json'
+        response = self.view(request, place_id=self.place.id,
+                             pk=self.submission.id,
+                             submission_type='comments',
+                             dataset__owner__username=self.owner.username,
+                             dataset__slug=self.dataset.slug,
+                             )
+        assert_equal(response.status_code, 200)
+        data = json.loads(response.content)
+        assert_equal(data['animal'], 'tree frog')
+        assert_equal(data.get('private-email'), 'admin@example.com')
+
+    @istest
+    def submission_get_request_hides_private_data_when_authenticated_with_key(self):
+        from django.contrib.sessions.models import SessionStore
+        from sa_api.apikey.auth import KEY_HEADER
+
+        self.submission.data = json.dumps({'animal': 'tree frog', 'private-email': 'admin@example.com'})
+        self.submission.save()
+        request = RequestFactory().get(self.url + '?show_private=on')
+        request.session = SessionStore()
+
+        request.META['HTTP_ACCEPT'] = 'application/json'
+        request.META[KEY_HEADER] = self.apikey.key
+        response = self.view(request, place_id=self.place.id,
+                             pk=self.submission.id,
+                             submission_type='comments',
+                             dataset__owner__username=self.owner.username,
+                             dataset__slug=self.dataset.slug,
+                             )
+        assert_equal(response.status_code, 403)
+
+    @istest
+    def submission_get_request_retrieves_private_data_when_authenticated_as_owner(self):
+        self.submission.data = json.dumps({'animal': 'tree frog', 'private-email': 'admin@example.com'})
+        self.submission.save()
+        request = RequestFactory().get(self.url + '?show_private=on')
+        request.user = self.submission.dataset.owner
+
+        request.META['HTTP_ACCEPT'] = 'application/json'
+        response = self.view(request, place_id=self.place.id,
+                             pk=self.submission.id,
+                             submission_type='comments',
+                             dataset__owner__username=self.owner.username,
+                             dataset__slug=self.dataset.slug,
+                             )
+        assert_equal(response.status_code, 200)
+        data = json.loads(response.content)
+        assert_equal(data.get('animal'), 'tree frog')
+        assert_equal(data.get('private-email'), 'admin@example.com')
+
+    @istest
+    def permissions_take_precedence_over_cache(self):
+        self.submission.data = json.dumps({'animal': 'tree frog', 'private-email': 'admin@example.com'})
+        self.submission.save()
+
+        # Anonymous user
+        request = RequestFactory().get(self.url + '?show_private=on')
+        request.user = mock.Mock(**{'is_authenticated.return_value': False,
+                                    'is_superuser': False,
+                                    })
+        request.META['HTTP_ACCEPT'] = 'application/json'
+        response = self.view(request, place_id=self.place.id,
+                             pk=self.submission.id,
+                             submission_type='comments',
+                             dataset__owner__username=self.owner.username,
+                             dataset__slug=self.dataset.slug,
+                             )
+        assert_equal(response.status_code, 403)
+
+        # Directly authenticated owner
+        request = RequestFactory().get(self.url + '?show_private=on')
+        request.user = self.submission.dataset.owner
+        request.META['HTTP_ACCEPT'] = 'application/json'
+        response = self.view(request, place_id=self.place.id,
+                             pk=self.submission.id,
+                             submission_type='comments',
+                             dataset__owner__username=self.owner.username,
+                             dataset__slug=self.dataset.slug,
+                             )
+        assert_equal(response.status_code, 200)
+
+        # Anonymous user again
+        request = RequestFactory().get(self.url + '?show_private=on')
+        request.user = mock.Mock(**{'is_authenticated.return_value': False,
+                                    'is_superuser': False,
+                                    })
+        request.META['HTTP_ACCEPT'] = 'application/json'
+        response = self.view(request, place_id=self.place.id,
+                             pk=self.submission.id,
+                             submission_type='comments',
+                             dataset__owner__username=self.owner.username,
+                             dataset__slug=self.dataset.slug,
+                             )
+        assert_equal(response.status_code, 403)
+
 
 
 class TestSubmissionCollectionView(TestCase):
@@ -465,13 +575,14 @@ class TestSubmissionCollectionView(TestCase):
         self.visible_place = Place.objects.create(dataset_id=self.dataset.id, location='POINT (0 0)', visible=True)
         self.visible_set = SubmissionSet.objects.create(place_id=self.visible_place.id, submission_type='vis')
 
-        self.visible_submission = Submission.objects.create(dataset_id=self.dataset.id, parent_id=self.visible_set.id, visible=True)
-        self.invisible_submission = Submission.objects.create(dataset_id=self.dataset.id, parent_id=self.visible_set.id, visible=False)
-
     @istest
     def get_queryset_checks_visibility(self):
         from ..views import SubmissionCollectionView
         view = SubmissionCollectionView()
+
+        # Create two submissions, one visisble, one invisible.
+        visible_submission = Submission.objects.create(dataset_id=self.dataset.id, parent_id=self.visible_set.id, visible=True)
+        invisible_submission = Submission.objects.create(dataset_id=self.dataset.id, parent_id=self.visible_set.id, visible=False)
 
         # Only visible Submissions by default...
         view.request = mock.Mock(GET={})
@@ -482,6 +593,64 @@ class TestSubmissionCollectionView(TestCase):
         view.request = mock.Mock(GET={'visible': 'all'})
         qs = view.get_queryset()
         assert_equal(qs.count(), 2)
+
+    @istest
+    def get_request_from_owner_should_return_private_data_for_all(self):
+        from ..views import SubmissionCollectionView
+        view = SubmissionCollectionView.as_view()
+
+        request_kwargs = {
+            'place_id': self.visible_place.id,
+            'submission_type': self.visible_set.submission_type,
+            'dataset__owner__username': self.owner.username,
+            'dataset__slug': self.dataset.slug,
+        }
+
+        # Create two submissions, one visisble, one invisible.
+        visible_submission = Submission.objects.create(dataset_id=self.dataset.id, parent_id=self.visible_set.id, visible=True,
+                                                       data=json.dumps({'x': 1, 'private-y': 2}))
+        invisible_submission = Submission.objects.create(dataset_id=self.dataset.id, parent_id=self.visible_set.id, visible=False,
+                                                         data=json.dumps({'x': 3, 'private-y': 4}))
+
+        request = RequestFactory().get(
+            reverse('submission_collection_by_dataset', kwargs=request_kwargs) + '?visible=all&show_private=true',
+            content_type='application/json')
+        request.user = self.owner
+        request.META['HTTP_ACCEPT'] = 'application/json'
+
+        response = view(request, **request_kwargs)
+
+        assert_equal(response.status_code, 200)
+        response_data = json.loads(response.content)
+        assert_equal(len(response_data), 2)
+        assert_in('private-y', response_data[0])
+
+    @istest
+    def get_request_should_disallow_private_data_access(self):
+        from ..views import SubmissionCollectionView
+        view = SubmissionCollectionView.as_view()
+
+        request_kwargs = {
+            'place_id': self.visible_place.id,
+            'submission_type': self.visible_set.submission_type,
+            'dataset__owner__username': self.owner.username,
+            'dataset__slug': self.dataset.slug,
+        }
+
+        # Create two submissions, one visisble, one invisible.
+        visible_submission = Submission.objects.create(dataset_id=self.dataset.id, parent_id=self.visible_set.id, visible=True,
+                                                       data=json.dumps({'x': 1, 'private-y': 2}))
+        invisible_submission = Submission.objects.create(dataset_id=self.dataset.id, parent_id=self.visible_set.id, visible=False,
+                                                         data=json.dumps({'x': 3, 'private-y': 4}))
+
+        request = RequestFactory().get(
+            reverse('submission_collection_by_dataset', kwargs=request_kwargs) + '?visible=all&show_private=true',
+            content_type='application/json')
+        request.META['HTTP_ACCEPT'] = 'application/json'
+
+        response = view(request, **request_kwargs)
+
+        assert_equal(response.status_code, 403)
 
 
 class TestActivityView(TestCase):
@@ -858,6 +1027,55 @@ class TestPlaceCollectionView(TestCase):
         assert_equal(ids, set([123, 124, 456, 457]))
 
     @istest
+    def order_by_proximity_to_a_point(self):
+        from ..views import PlaceCollectionView, models
+
+        user = User.objects.create(username='test-user')
+        ds = models.DataSet.objects.create(owner=user, id=789,
+                                           slug='stuff')
+        location = 'POINT (0.0 0.0)'
+        models.Place.objects.create(dataset=ds, id=123, location='POINT (1 1)', visible=True, data=json.dumps({'favorite_food': 'pizza', 'favorite_color': 'red'}))
+        models.Place.objects.create(dataset=ds, id=124, location='POINT (0 0)', visible=True, data=json.dumps({'favorite_food': 'asparagus', 'favorite_color': 'green'}))
+        models.Place.objects.create(dataset=ds, id=125, location='POINT (0 2)', visible=True, data=json.dumps({'favorite_food': 'pizza', 'favorite_color': 'blue'}))
+        models.Place.objects.create(dataset=ds, id=126, location='POINT (1 0.5)', visible=True, data=json.dumps({'favorite_food': 'chili', 'favorite_color': 'yellow'}))
+        view = PlaceCollectionView.as_view()
+
+        request = RequestFactory().get('/api/v1/test-user/datasets/stuff/places/?near=0.5,1.0')
+        request.user = user
+        request.META['HTTP_ACCEPT'] = 'application/json'
+
+        response = view(request,
+                        dataset__owner__username='test-user',
+                        dataset__slug='stuff')
+
+        places = json.loads(response.content)
+        ids = [place['id'] for place in places]
+        assert_equal(ids, [126, 123, 124, 125])
+
+    @istest
+    def enforces_valid_near_parameter(self):
+        from ..views import PlaceCollectionView, models
+        view = PlaceCollectionView.as_view()
+
+        # Single number
+        request = RequestFactory().get('/api/v1/test-user/datasets/stuff/places/?near=0.5')
+        request.META['HTTP_ACCEPT'] = 'application/json'
+        response = view(request, dataset__owner__username='test-user', dataset__slug='stuff')
+        assert_equal(response.status_code, 400)
+
+        # Two items, non-numeric
+        request = RequestFactory().get('/api/v1/test-user/datasets/stuff/places/?near=0.5,hello')
+        request.META['HTTP_ACCEPT'] = 'application/json'
+        response = view(request, dataset__owner__username='test-user', dataset__slug='stuff')
+        assert_equal(response.status_code, 400)
+
+        # More than two numbers
+        request = RequestFactory().get('/api/v1/test-user/datasets/stuff/places/?near=1,1,1')
+        request.META['HTTP_ACCEPT'] = 'application/json'
+        response = view(request, dataset__owner__username='test-user', dataset__slug='stuff')
+        assert_equal(response.status_code, 400)
+
+    @istest
     def get_filters_on_data_fields(self):
         from ..views import PlaceCollectionView, models
 
@@ -917,6 +1135,66 @@ class TestPlaceCollectionView(TestCase):
         assert_equal(len(places), 1)
         ids = set([place['id'] for place in places])
         assert_equal(ids, set([123]))
+
+    @istest
+    def get_request_from_owner_should_return_private_data_for_all(self):
+        from ..views import PlaceCollectionView
+        view = PlaceCollectionView.as_view()
+
+        owner = User.objects.create(username='superman')
+        dataset = DataSet.objects.create(owner=owner, slug='moth')
+
+        request_kwargs = {
+            'dataset__owner__username': owner.username,
+            'dataset__slug': dataset.slug,
+        }
+
+        # Create two places, one visisble, one invisible.
+        visible_place = Place.objects.create(dataset_id=dataset.id, location='POINT(0 0)', visible=True,
+                                             data=json.dumps({'x': 1, 'private-y': 2}))
+        invisible_place = Place.objects.create(dataset_id=dataset.id, location='POINT(0 0)', visible=False,
+                                               data=json.dumps({'x': 3, 'private-y': 4}))
+
+        request = RequestFactory().get(
+            reverse('place_collection_by_dataset', kwargs=request_kwargs) + '?visible=all&show_private=true',
+            content_type='application/json')
+        request.user = owner
+        request.META['HTTP_ACCEPT'] = 'application/json'
+
+        response = view(request, **request_kwargs)
+
+        assert_equal(response.status_code, 200)
+        response_data = json.loads(response.content)
+        assert_equal(len(response_data), 2)
+        assert_in('private-y', response_data[0])
+
+    @istest
+    def get_request_should_disallow_private_data_access(self):
+        from ..views import PlaceCollectionView
+        view = PlaceCollectionView.as_view()
+
+        owner = User.objects.create(username='superman')
+        dataset = DataSet.objects.create(owner=owner, slug='moth')
+
+        request_kwargs = {
+            'dataset__owner__username': owner.username,
+            'dataset__slug': dataset.slug,
+        }
+
+        # Create two submissions, one visisble, one invisible.
+        visible_place = Place.objects.create(dataset_id=dataset.id, location='POINT(0 0)', visible=True,
+                                             data=json.dumps({'x': 1, 'private-y': 2}))
+        invisible_place = Place.objects.create(dataset_id=dataset.id, location='POINT(0 0)', visible=False,
+                                               data=json.dumps({'x': 3, 'private-y': 4}))
+
+        request = RequestFactory().get(
+            reverse('place_collection_by_dataset', kwargs=request_kwargs) + '?visible=all&show_private=true',
+            content_type='application/json')
+        request.META['HTTP_ACCEPT'] = 'application/json'
+
+        response = view(request, **request_kwargs)
+
+        assert_equal(response.status_code, 403)
 
 
 class TestApiKeyCollectionView(TestCase):
@@ -1034,7 +1312,7 @@ class TestOwnerPasswordView(TestCase):
         new_password = user1.password
 
         assert_equal(current_password, new_password)
-        assert_equal(response.status, 403)
+        assert_equal(response.status_code, 403)
 
     @istest
     def put_403s_if_wrong_user_is_authenticated(self):

@@ -42,6 +42,18 @@ class ModelResourceWithDataBlob (resources.ModelResource):
     'data' JSON blob of arbitrary key/value pairs.
     """
 
+    def should_show_private_data(self):
+        if not hasattr(self, 'view') or self.view is None:
+            return False
+
+        if not hasattr(self.view, 'show_private_data'):
+            return False
+
+        if self.view.show_private_data is not True:
+            return False
+
+        return True
+
     def serialize(self, obj, *args, **kwargs):
         # If the object is a place, parse the data blob and add it to the
         # place's fields.
@@ -49,6 +61,11 @@ class ModelResourceWithDataBlob (resources.ModelResource):
         if isinstance(obj, self.model):
             data = json.loads(obj.data)
             serialization.pop('data', None)
+
+            if not self.should_show_private_data():
+                for key in data.keys():
+                    if key.startswith('private-'):
+                        del data[key]
             serialization.update(data)
 
         return serialization
@@ -148,11 +165,16 @@ class PlaceResource (ModelResourceWithDataBlob):
         return super(PlaceResource, self).validate_request(data, files)
 
     def filter_response(self, obj):
+        """
+        Further filter results, beyond DB filtering. This must be done here
+        because we cannot filter based on data blob values in the DB directly
+        unless we impleent some indexing.
+        """
         data = super(PlaceResource, self).filter_response(obj)
 
         if isinstance(data, list):
             # These filters will have been applied when constructing the queryset
-            special_filters = set(['visible', 'format'])
+            special_filters = set(['visible', 'format', 'show_private', 'near'])
 
             for key, values in self.view.request.GET.iterlists():
                 if key not in special_filters:

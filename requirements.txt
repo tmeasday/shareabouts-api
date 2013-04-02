@@ -1,6 +1,5 @@
 # The server
-#django>=1.4
-https://www.djangoproject.com/download/1.5c1/tarball/#egg=django
+django>=1.4
 # gevent
 gunicorn
 
@@ -13,14 +12,7 @@ boto
 django-storages
 
 # REST API
-#
-# NOTE: We are using commit abd3c7b46 of Django REST Framework because of an
-#       issue with the current head.  For details, see the discussion at
-#       https://github.com/tomchristie/django-rest-framework/pull/181
-#
-#       - mjumbewu, 28 Aug 2012
-#
-git+git://github.com/mjumbewu/django-rest-framework-0.4.git@shareabouts-customizations#egg=djangorestframework
+djangorestframework>=2.2
 markdown
 python-dateutil
 ujson
@@ -34,3 +26,8 @@ django-nose
 mock
 mock_django
 django-debug-toolbar
+
+# =====================================
+
+# For DRF 0.4 (deprecated)
+URLObject>=0.6.0

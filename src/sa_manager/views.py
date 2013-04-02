@@ -4,7 +4,7 @@ from django.core.urlresolvers import reverse
 from django.http import HttpResponse
 from django.shortcuts import render, redirect
 from django.utils.decorators import method_decorator
-from django.views.generic import View, FormView
+from django.views.generic import View, FormView, TemplateView
 from . import forms
 import ujson as json
 import requests
@@ -19,13 +19,13 @@ class ShareaboutsApi (object):
         'dataset_collection': r'{username}/datasets/',
         'dataset_instance': r'{username}/datasets/{slug}/',
         'keys_collection': r'{username}/datasets/{dataset_slug}/keys/',
-        'place_collection': r'{username}/datasets/{dataset_slug}/places/?visible=all',
-        'place_collection_table': r'{username}/datasets/{dataset_slug}/places/table?visible=all',
-        'place_instance': r'{username}/datasets/{dataset_slug}/places/{pk}/',
-        'submission_collection': r'{username}/datasets/{dataset_slug}/places/{place_pk}/{type}/?visible=all',
-        'submission_instance': r'{username}/datasets/{dataset_slug}/places/{place_pk}/{type}/{pk}/',
-        'all_submissions': r'{username}/datasets/{dataset_slug}/{type}/',
-        'all_submissions_table': r'{username}/datasets/{dataset_slug}/{type}/table',
+        'place_collection': r'{username}/datasets/{dataset_slug}/places/?visible=all&show_private=true',
+        'place_collection_table': r'{username}/datasets/{dataset_slug}/places/table?visible=all&show_private=true',
+        'place_instance': r'{username}/datasets/{dataset_slug}/places/{pk}/?show_private=true',
+        'submission_collection': r'{username}/datasets/{dataset_slug}/places/{place_pk}/{type}/?visible=all&show_private=true',
+        'submission_instance': r'{username}/datasets/{dataset_slug}/places/{place_pk}/{type}/{pk}/?show_private=true',
+        'all_submissions': r'{username}/datasets/{dataset_slug}/{type}/?show_private=true',
+        'all_submissions_table': r'{username}/datasets/{dataset_slug}/{type}/table?show_private=true',
     }
 
     def __init__(self, request=None, root='/api/v1/'):
@@ -512,6 +512,31 @@ class ExistingDataSetView (DataSetFormMixin, View):
         else:
             # TODO ???
             pass
+
+
+class DataSetReportingView (TemplateView):
+    template_name = 'manager/dataset_reports.html'
+
+    def get_context_data(self, **kwargs):
+        context = super(DataSetReportingView, self).get_context_data(**kwargs)
+
+        request, dataset_slug = self.request, self.kwargs['dataset_slug']
+
+        api = ShareaboutsApi(request)
+        api.authenticate(request)
+        dataset_uri = api.build_uri('dataset_instance', username=request.user.username, slug=dataset_slug)
+        places_uri = api.build_uri('place_collection', username=request.user.username, dataset_slug=dataset_slug)
+
+        places = api.get(places_uri)
+        dataset = api.get(dataset_uri)
+
+        context['places'] = places
+        context['dataset'] = dataset
+
+        context['places_json'] = json.dumps(places)
+        context['dataset_json'] = json.dumps(dataset)
+
+        return context
 
 
 class SubmissionMixin (BaseDataBlobFormMixin):

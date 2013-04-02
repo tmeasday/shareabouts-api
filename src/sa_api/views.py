@@ -6,11 +6,12 @@ from . import resources
 from . import utils
 from django.conf import settings
 from django.contrib import auth
+from django.contrib.gis import geos
 from django.core.cache import cache
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
-from djangorestframework import views, permissions, mixins, authentication
+from djangorestframework import views, permissions, mixins, authentication, status
 from djangorestframework.response import Response, ErrorResponse
 import apikey.auth
 import ujson as json
@@ -65,7 +66,41 @@ class IsOwnerOrSuperuserWithoutApiKey(IsOwnerOrSuperuser):
         from .apikey.auth import KEY_HEADER
         if KEY_HEADER in self.view.request.META:
             raise permissions._403_FORBIDDEN_RESPONSE
+
         return super(IsOwnerOrSuperuserWithoutApiKey, self).check_permission(user)
+
+
+class CanShowPrivateData (permissions.BasePermission):
+    def check_permission(self, user):
+        if 'show_private' not in self.view.request.GET:
+            return
+
+        if hasattr(user, 'is_directly_authenticated') and user.is_directly_authenticated is True:
+            if user.is_superuser or user.username == self.view.allowed_username:
+                self.view.show_private_data = True
+                return
+
+        raise permissions._403_FORBIDDEN_RESPONSE
+
+
+class DirectAuthenticationMixin (object):
+    def authenticate(self, request):
+        user = super(DirectAuthenticationMixin, self).authenticate(request)
+
+        # If it passed the parent's authentication, specify that the user is
+        # authenticated directly, and not through an API key.
+        if user is not None:
+            user.is_directly_authenticated = True
+
+        return user
+
+
+class BasicAuthentication (DirectAuthenticationMixin, authentication.BasicAuthentication):
+    pass
+
+
+class UserLoggedInAuthentication (DirectAuthenticationMixin, authentication.UserLoggedInAuthentication):
+    pass
 
 
 class AuthMixin(object):
@@ -76,8 +111,8 @@ class AuthMixin(object):
     You should set the ``allowed_user_kwarg`` attribute to tell dispatch()
     how to get the name of the resource's owner from the request kwargs;
     """
-    authentication = [authentication.BasicAuthentication,
-                      authentication.UserLoggedInAuthentication,
+    authentication = [BasicAuthentication,
+                      UserLoggedInAuthentication,
                       apikey.auth.ApiKeyAuthentication]
 
     unsafe_permissions = [IsOwnerOrSuperuser]
@@ -89,10 +124,7 @@ class AuthMixin(object):
         # We do this in dispatch() so we can apply permission checks
         # to only some request methods.
         self.request = request  # Not sure what needs this.
-        if getattr(request, 'user', None) is None:
-            # Probably happens only in tests that have forgotten to
-            # set the user?
-            return permissions._403_FORBIDDEN_RESPONSE.response
+
         # This triggers authentication (view.user is a property).
         user = self.user
 
@@ -146,10 +178,19 @@ class CachedMixin (object):
         keyset = cache.get(metakey) or set()
 
         if (response_data is not None) and (key in keyset):
-            response = self.respond_from_cache(response_data)
+            cached_response = self.respond_from_cache(response_data)
+
+            # Patch the HTTP method
+            setattr(self, self.method.lower(),
+                    lambda *args, **kwargs: cached_response)
+
+            response = super(CachedMixin, self).dispatch(request, *args, **kwargs)
         else:
             response = super(CachedMixin, self).dispatch(request, *args, **kwargs)
-            self.cache_response(key, response)
+
+            # Only cache on OK resposne
+            if response.status_code == 200:
+                self.cache_response(key, response)
 
         # Disable client-side caching. Cause IE wrongly assumes that it should
         # cache.
@@ -240,8 +281,20 @@ class ActivityGeneratingMixin (object):
         return {'silent': silent}
 
 
-class ModelViewWithDataBlobMixin (object):
+class OwnerAwareMixin (object):
+    def dispatch(self, request, *args, **kwargs):
+        # allowed_user_kwarg should be the name of the kwarg in the URL that
+        # designates the username of the owner of the resource
+        self.allowed_username = kwargs[self.allowed_user_kwarg]
+        return super(OwnerAwareMixin, self).dispatch(request, *args, **kwargs)
+
+
+class ModelViewWithDataBlobMixin (OwnerAwareMixin):
     parsers = parsers.DEFAULT_DATA_BLOB_PARSERS
+
+    def __init__(self, *args, **kwargs):
+        self.permissions += (CanShowPrivateData,)
+        super(ModelViewWithDataBlobMixin, self).__init__(*args, **kwargs)
 
     def _perform_form_overloading(self):
         """
@@ -321,6 +374,16 @@ class PlaceCollectionView (Ignore_CacheBusterMixin, AuthMixin, AbsUrlMixin, Acti
         visibility = self.request.GET.get('visible', 'true')
         queryset = super(PlaceCollectionView, self).get_queryset()
 
+        if 'near' in self.request.GET:
+            try:
+                lat, lng = map(float, self.request.GET['near'].split(','))
+            except ValueError:
+                raise ErrorResponse(
+                    status.HTTP_400_BAD_REQUEST,
+                    {'detail': 'The near parameter should be a comma-separated pair of numbers.'})
+
+            queryset = queryset.distance(geos.Point(lng, lat)).order_by('distance')
+
         if (visibility == 'all'):
             return queryset
         elif visibility == 'true':
@@ -342,7 +405,7 @@ class PlaceInstanceView (Ignore_CacheBusterMixin, AuthMixin, AbsUrlMixin, Activi
     resource = resources.PlaceResource
 
 
-class ApiKeyCollectionView (Ignore_CacheBusterMixin, AbsUrlMixin, ModelViewWithDataBlobMixin, views.ListModelView):
+class ApiKeyCollectionView (Ignore_CacheBusterMixin, AbsUrlMixin, OwnerAwareMixin, views.ListModelView):
     """
     Get a list of API keys valid for this DataSet.
 
@@ -367,10 +430,9 @@ class ApiKeyCollectionView (Ignore_CacheBusterMixin, AbsUrlMixin, ModelViewWithD
 
     def dispatch(self, request, *args, **kwargs):
         # Set up context needed by permissions checks.
-        self.allowed_username = kwargs[self.allowed_user_kwarg]
         self.dataset = get_object_or_404(
             models.DataSet,
-            owner__username=self.allowed_username,
+            owner__username=kwargs[self.allowed_user_kwarg],
             slug=kwargs['datasets__slug'])
         self.request = request  # Not sure what needs this.
         return super(ApiKeyCollectionView, self).dispatch(request, *args, **kwargs)
